@@ -6,7 +6,6 @@ import qualified Data.Map.Strict as M
 import System.IO (hFlush, stdout)
 import System.Process (readProcess)
 import Data.Char (toUpper)
-import Data.List (foldl')
 
 -- ============================================================
 -- CONFIG
@@ -22,7 +21,7 @@ faucetAmount :: Int
 faucetAmount = 1000
 
 burnFailurePct :: Int
-burnFailurePct = 50  -- burn 50% of deposit if proposal fails (incl. quorum fail)
+burnFailurePct = 50  -- burn 50% of deposit if proposal fails (incl quorum fail)
 
 initialTreasury :: Int
 initialTreasury = 100000
@@ -67,9 +66,7 @@ promptInt s = do
 promptPct :: String -> IO Int
 promptPct s = do
   n <- promptInt s
-  if n < 0 || n > 100
-    then putStrLn (paint red "Enter 0..100") >> promptPct s
-    else return n
+  if n < 0 || n > 100 then putStrLn (paint red "Enter 0..100") >> promptPct s else return n
 
 pause :: IO ()
 pause = do
@@ -108,6 +105,9 @@ data Category = Funding | Policy | Info deriving (Eq, Show)
 
 data ProposalStatus = POpen | PClosed | PFinalized deriving (Eq, Show)
 
+-- Commit–Reveal
+type Commitment = String
+
 data Proposal = Proposal
   { pId            :: ProposalId
   , pTitle         :: String
@@ -116,18 +116,28 @@ data Proposal = Proposal
   , pMode          :: VoteMode
   , pProposer      :: WalletId
   , pDeposit       :: Int
+
   , pStart         :: SlotNo
   , pEnd           :: SlotNo
-  , pQuorumPct     :: Int              -- 0..100
-  , pEligSnap      :: Int              -- eligible wallets snapshot (for 1p1v)
-  , pStakeSnap     :: Int              -- total staked snapshot (for stake mode)
+  , pRevealEnd     :: SlotNo            -- reveals allowed until this slot (inclusive)
+
+  , pQuorumPct     :: Int               -- 0..100
+  , pEligSnap      :: Int               -- eligible wallets snapshot (for 1p1v)
+  , pStakeSnap     :: Int               -- total staked snapshot (for stake mode)
+
   , pFundingTarget :: Maybe (WalletId, Int) -- (recipient, amount) if Funding
+
   , pStatus        :: ProposalStatus
-  , pVotes         :: M.Map WalletId (Vote, Int) -- stores vote + weight at time of vote
-  , pResult        :: Maybe Bool        -- Just True/False when finalized
+
+  -- Commit–Reveal storage
+  , pCommits       :: M.Map WalletId (Commitment, Int) -- commitment + weight snapshot
+  , pReveals       :: M.Map WalletId Vote              -- revealed vote (validated)
+
+  -- Results (set on finalize)
+  , pResult        :: Maybe Bool
   , pYesTotal      :: Int
   , pNoTotal       :: Int
-  , pPartTotal     :: Int               -- participation total used for quorum
+  , pPartTotal     :: Int
   } deriving Show
 
 data Wallet = Wallet
@@ -147,8 +157,9 @@ data Event
   | ECreateWallet WalletId
   | EFaucet WalletId Int
   | EStake WalletId Int
-  | ECreateProposal ProposalId WalletId Int Category VoteMode SlotNo SlotNo Int
-  | EVote ProposalId WalletId Vote Int
+  | ECreateProposal ProposalId WalletId Int Category VoteMode SlotNo SlotNo SlotNo Int
+  | ECommitVote ProposalId WalletId Commitment Int
+  | ERevealVote ProposalId WalletId Vote Int
   | EClose ProposalId
   | EFinalize ProposalId Bool Int Int Int
   | ETreasuryTransfer ProposalId WalletId Int
@@ -187,20 +198,7 @@ data Chain = Chain
 
 initChain :: Chain
 initChain =
-  Chain
-    { csSlot      = 0
-    , csNextWid   = 1
-    , csWallets   = M.empty
-    , csProposals = M.empty
-
-    , csPropCount = M.empty
-    , csTreasury  = initialTreasury
-    , csBurned    = 0
-
-    , csEvents    = []
-    , csNextEIx   = 0
-    , csLastHash  = replicate 64 '0'
-    }
+  Chain 0 1 M.empty M.empty M.empty initialTreasury 0 [] 0 (replicate 64 '0')
 
 -- ============================================================
 -- GOVERNANCE / ECONOMICS
@@ -239,16 +237,56 @@ appendEvent st ev = do
     }
 
 verifyAudit :: Chain -> IO Bool
-verifyAudit st = do
-  let entries = csEvents st
-  let go _ [] = return True
-      go expectedPrev (e:es) = do
-        let payload = show (leIx e) ++ "|" ++ show (leSlot e) ++ "|" ++ show (leEvent e) ++ "|" ++ expectedPrev
-        h <- hash256 payload
-        if lePrev e /= expectedPrev then return False
-        else if leHash e /= h then return False
-        else go (leHash e) es
-  go (replicate 64 '0') entries
+verifyAudit st = go (replicate 64 '0') (csEvents st)
+  where
+    go _ [] = return True
+    go expectedPrev (e:es) = do
+      let payload = show (leIx e) ++ "|" ++ show (leSlot e) ++ "|" ++ show (leEvent e) ++ "|" ++ expectedPrev
+      h <- hash256 payload
+      if lePrev e /= expectedPrev then return False
+      else if leHash e /= h then return False
+      else go (leHash e) es
+
+-- ============================================================
+-- QUORUM + TALLY (counts REVEALS)
+-- ============================================================
+
+ceilingDiv :: Int -> Int -> Int
+ceilingDiv a b = (a + b - 1) `div` b
+
+requiredParticipation :: Proposal -> Int
+requiredParticipation p =
+  case pMode p of
+    OnePersonOneVote -> ceilingDiv (pQuorumPct p * pEligSnap p) 100
+    StakeWeighted    -> ceilingDiv (pQuorumPct p * pStakeSnap p) 100
+
+computeTally :: Proposal -> (Int, Int, Int)
+computeTally p =
+  case pMode p of
+    OnePersonOneVote ->
+      let vs = M.elems (pReveals p)
+          yes = length [() | YES <- vs]
+          no  = length [() | NO  <- vs]
+          part = length vs
+      in (yes, no, part)
+    StakeWeighted ->
+      let -- weight snapshot comes from commits (validated reveals must have a commit)
+          yes = sum [ w | (wid, YES) <- M.toList (pReveals p)
+                        , Just (_, w) <- [M.lookup wid (pCommits p)] ]
+          no  = sum [ w | (wid, NO)  <- M.toList (pReveals p)
+                        , Just (_, w) <- [M.lookup wid (pCommits p)] ]
+          part = sum [ w | (wid, _) <- M.toList (pReveals p)
+                         , Just (_, w) <- [M.lookup wid (pCommits p)] ]
+      in (yes, no, part)
+
+-- ============================================================
+-- COMMITMENT (simple tutorial version)
+-- commitment = SHA256(proposalId|walletId|VOTE|salt)
+-- ============================================================
+
+mkCommitment :: ProposalId -> WalletId -> Vote -> String -> IO Commitment
+mkCommitment pid wid v salt =
+  hash256 (pid ++ "|" ++ show wid ++ "|" ++ show v ++ "|" ++ salt)
 
 -- ============================================================
 -- UI RENDER
@@ -258,7 +296,7 @@ renderUI :: Chain -> IO ()
 renderUI st = do
   clearScreen
   putStrLn (paint cyan "======================================================================")
-  putStrLn (paint magenta "   CARDANO-LIKE GOVERNANCE L1  (Quorum + Stake + Audit + Categories)")
+  putStrLn (paint magenta "   GOVERNANCE L1  (Commit–Reveal + Quorum + Stake + Audit + Treasury)")
   putStrLn (paint cyan "======================================================================")
   putStrLn $
     paint green (" Slot: " ++ show (csSlot st)) ++
@@ -269,18 +307,14 @@ renderUI st = do
     paint gray (" | Burned: " ++ show (csBurned st)) ++
     paint gray (" | Ledger: " ++ short (csLastHash st))
   putStrLn (paint cyan "----------------------------------------------------------------------")
-  putStrLn (paint white " | CHAIN               | WALLETS                     | GOVERNANCE     |")
-  putStrLn (paint cyan  " |---------------------+-----------------------------+----------------|")
-  putStrLn (paint white " | 1 Advance Slot      | 2 Create Wallet (secret)    | 6 List Proposals")
-  putStrLn (paint white " |                     | 3 Faucet Wallet             | 7 Vote (select)")
-  putStrLn (paint white " |                     | 4 List Wallets              | 8 Close (select)")
-  putStrLn (paint white " |                     | 5 Stake Tokens              | 9 Finalize (select)")
-  putStrLn (paint cyan  " |---------------------+-----------------------------+----------------|")
-  putStrLn (paint white " | AUDIT               |                             |                |")
-  putStrLn (paint cyan  " |---------------------+-----------------------------+----------------|")
-  putStrLn (paint white " | 10 View Audit Log   | 11 Verify Audit Hash-Chain  | 12 Create Proposal")
-  putStrLn (paint cyan  "----------------------------------------------------------------------")
-  putStrLn (paint red   " | 0 Exit                                                             |")
+  putStrLn (paint white " 1 Advance Slot      6 List Proposals")
+  putStrLn (paint white " 2 Create Wallet     7 Commit Vote (select)")
+  putStrLn (paint white " 3 Faucet Wallet     8 Reveal Vote (select)")
+  putStrLn (paint white " 4 List Wallets      9 Close Proposal (select)")
+  putStrLn (paint white " 5 Stake Tokens     10 Finalize Proposal (select)")
+  putStrLn (paint white "12 Create Proposal  13 View Audit Log")
+  putStrLn (paint white "14 Verify Audit Chain")
+  putStrLn (paint red   " 0 Exit")
   putStrLn (paint cyan "======================================================================")
 
 printWallets :: Chain -> IO ()
@@ -324,18 +358,22 @@ printProposals st = do
 
     pp p = do
       let col = statusCol (pStatus p)
-          window = show (pStart p) ++ "→" ++ show (pEnd p)
+          win = show (pStart p) ++ "→" ++ show (pEnd p)
+          rwin = show (pEnd p + 1) ++ "→" ++ show (pRevealEnd p)
           q = "quorum=" ++ show (pQuorumPct p) ++ "%"
-          tally =
-            case pStatus p of
-              PFinalized ->
-                " YES=" ++ show (pYesTotal p) ++ " NO=" ++ show (pNoTotal p) ++ " part=" ++ show (pPartTotal p)
-                ++ " result=" ++ show (pResult p)
-              _ -> " votes=" ++ show (M.size (pVotes p))
+          commitsN = M.size (pCommits p)
+          revealsN = M.size (pReveals p)
           extra =
             case pFundingTarget p of
               Nothing -> ""
               Just (to, amt) -> " -> #" ++ show to ++ " amt=" ++ show amt
+          finalTxt =
+            case pStatus p of
+              PFinalized ->
+                " YES=" ++ show (pYesTotal p) ++ " NO=" ++ show (pNoTotal p)
+                ++ " part=" ++ show (pPartTotal p)
+                ++ " result=" ++ show (pResult p)
+              _ -> ""
       putStrLn $
         paint white ("  " ++ short (pId p)) ++ " " ++
         paint col ("[" ++ show (pStatus p) ++ "] ") ++
@@ -343,119 +381,102 @@ printProposals st = do
         paint gray ("  cat=" ++ catTxt (pCategory p)
                    ++ " mode=" ++ modeTxt (pMode p)
                    ++ " " ++ q
-                   ++ " win=" ++ window
+                   ++ " vote=" ++ win
+                   ++ " reveal=" ++ rwin
                    ++ " dep=" ++ show (pDeposit p)
                    ++ " prop=#" ++ show (pProposer p)
                    ++ extra
-                   ++ tally)
+                   ++ " commits=" ++ show commitsN
+                   ++ " reveals=" ++ show revealsN
+                   ++ finalTxt)
 
 -- ============================================================
--- PROPOSAL SELECTION (no hash typing)
+-- PROPOSAL SELECTION
 -- ============================================================
 
 data SelectFilter
-  = VoteableNow
+  = CommitableNow
+  | RevealableNow
   | AnyOpen
-  | ClosedOnly
+  | FinalizableNow
 
 selectProposal :: Chain -> SelectFilter -> IO (Maybe Proposal)
 selectProposal st filt = do
   let psAll = M.elems (csProposals st)
       ps = case filt of
-             VoteableNow -> filter isVoteable psAll
-             AnyOpen     -> filter (\p -> pStatus p == POpen) psAll
-             ClosedOnly  -> filter (\p -> pStatus p == PClosed) psAll
+             CommitableNow -> filter isCommitable psAll
+             RevealableNow -> filter isRevealable psAll
+             AnyOpen       -> filter (\p -> pStatus p == POpen) psAll
+             FinalizableNow-> filter isFinalizable psAll
 
   if null ps
     then do
       case filt of
-        VoteableNow -> do
-          putStrLn (paint yellow "No proposals currently accepting votes.")
-          explainWhy st
-        AnyOpen     -> putStrLn (paint gray "No open proposals.")
-        ClosedOnly  -> putStrLn (paint gray "No closed proposals ready to finalize.")
+        CommitableNow  -> putStrLn (paint yellow "No proposals currently accepting COMMIT votes.")
+        RevealableNow  -> putStrLn (paint yellow "No proposals currently accepting REVEALS.")
+        AnyOpen        -> putStrLn (paint gray "No open proposals.")
+        FinalizableNow -> putStrLn (paint gray "No proposals ready to finalize (must be closed and reveal window ended).")
+      explainWhy st filt
       pause
       return Nothing
     else do
       putStrLn (paint cyan "------------------------------------------------------------------")
-      mapM_ (ppLine st) (zip [1..] ps)
+      mapM_ (ppLine st filt) (zip [1..] ps)
       putStrLn (paint cyan "------------------------------------------------------------------")
       n <- promptInt "Select proposal number: "
       if n < 1 || n > length ps
-        then do
-          putStrLn (paint red "Invalid selection.")
-          pause
-          return Nothing
+        then putStrLn (paint red "Invalid selection.") >> pause >> return Nothing
         else return (Just (ps !! (n - 1)))
 
   where
-    isVoteable p =
-      pStatus p == POpen
-      && csSlot st >= pStart p
-      && csSlot st <= pEnd p
+    isCommitable p =
+      pStatus p == POpen && csSlot st >= pStart p && csSlot st <= pEnd p
 
-ppLine :: Chain -> (Int, Proposal) -> IO ()
-ppLine st (i, p) = do
-  let win = show (pStart p) ++ "→" ++ show (pEnd p)
-      modeTxt OnePersonOneVote = "1p1v"
-      modeTxt StakeWeighted    = "stake"
-      catTxt Funding = "Funding"
-      catTxt Policy  = "Policy"
-      catTxt Info    = "Info"
-      voteable = (pStatus p == POpen && csSlot st >= pStart p && csSlot st <= pEnd p)
-      tag = if voteable then paint green "VOTE NOW" else paint gray "not voteable"
+    isRevealable p =
+      pStatus p == PClosed && csSlot st >= (pEnd p + 1) && csSlot st <= pRevealEnd p
+
+    isFinalizable p =
+      pStatus p == PClosed && csSlot st > pRevealEnd p
+
+ppLine :: Chain -> SelectFilter -> (Int, Proposal) -> IO ()
+ppLine st filt (i, p) = do
+  let voteWin = show (pStart p) ++ "→" ++ show (pEnd p)
+      revWin  = show (pEnd p + 1) ++ "→" ++ show (pRevealEnd p)
+      tag =
+        case filt of
+          CommitableNow  -> if csSlot st >= pStart p && csSlot st <= pEnd p then paint green "COMMIT NOW" else paint gray "not commitable"
+          RevealableNow  -> if csSlot st >= (pEnd p + 1) && csSlot st <= pRevealEnd p then paint green "REVEAL NOW" else paint gray "not revealable"
+          FinalizableNow -> if csSlot st > pRevealEnd p then paint green "FINALIZE" else paint gray "not finalizable"
+          AnyOpen        -> paint gray "open"
   putStrLn $
     paint white ("[" ++ show i ++ "] ") ++
     paint cyan (pTitle p) ++
-    paint gray ("  (" ++ catTxt (pCategory p) ++ "/" ++ modeTxt (pMode p) ++ ")") ++
-    paint gray ("  win=" ++ win) ++
-    paint gray ("  votes=" ++ show (M.size (pVotes p))) ++
+    paint gray (" vote=" ++ voteWin ++ " reveal=" ++ revWin) ++
+    paint gray (" commits=" ++ show (M.size (pCommits p)) ++ " reveals=" ++ show (M.size (pReveals p))) ++
     "  " ++ tag
 
-explainWhy :: Chain -> IO ()
-explainWhy st = do
+explainWhy :: Chain -> SelectFilter -> IO ()
+explainWhy st filt = do
   let ps = M.elems (csProposals st)
       openPs = filter (\p -> pStatus p == POpen) ps
-  if null openPs
-    then putStrLn (paint gray "Reason: there are no open proposals.")
-    else do
-      putStrLn (paint gray "Open proposals exist, but voting may be outside the window:")
-      mapM_ (\p ->
-        putStrLn $
-          paint gray (" - " ++ pTitle p ++ ": window " ++ show (pStart p) ++ "→" ++ show (pEnd p)
-            ++ ", current slot " ++ show (csSlot st))
-        ) openPs
-
--- ============================================================
--- QUORUM + TALLY
--- ============================================================
-
-requiredParticipation :: Proposal -> Int
-requiredParticipation p =
-  case pMode p of
-    OnePersonOneVote ->
-      ceilingDiv (pQuorumPct p * pEligSnap p) 100
-    StakeWeighted ->
-      ceilingDiv (pQuorumPct p * pStakeSnap p) 100
-
-ceilingDiv :: Int -> Int -> Int
-ceilingDiv a b = (a + b - 1) `div` b
-
-computeTally :: Proposal -> (Int, Int, Int)
-computeTally p =
-  case pMode p of
-    OnePersonOneVote ->
-      let votes = M.elems (pVotes p)
-          yes = length [() | (YES,_) <- votes]
-          no  = length [() | (NO,_)  <- votes]
-          part = length votes
-      in (yes, no, part)
-    StakeWeighted ->
-      let votes = M.elems (pVotes p)
-          yes = sum [w | (YES,w) <- votes]
-          no  = sum [w | (NO,w)  <- votes]
-          part = sum [w | (_,w) <- votes]
-      in (yes, no, part)
+      closedPs = filter (\p -> pStatus p == PClosed) ps
+  case filt of
+    CommitableNow ->
+      if null openPs then putStrLn (paint gray "Reason: no open proposals.")
+      else do
+        putStrLn (paint gray "Open proposals exist, but current slot may be outside vote window:")
+        mapM_ (\p -> putStrLn (paint gray (" - " ++ pTitle p ++ ": vote " ++ show (pStart p) ++ "→" ++ show (pEnd p) ++ ", current " ++ show (csSlot st)))) openPs
+    RevealableNow ->
+      if null closedPs then putStrLn (paint gray "Reason: no closed proposals (close one first).")
+      else do
+        putStrLn (paint gray "Closed proposals exist, but current slot may be outside reveal window:")
+        mapM_ (\p -> putStrLn (paint gray (" - " ++ pTitle p ++ ": reveal " ++ show (pEnd p + 1) ++ "→" ++ show (pRevealEnd p) ++ ", current " ++ show (csSlot st)))) closedPs
+    FinalizableNow ->
+      if null closedPs then putStrLn (paint gray "Reason: no closed proposals.")
+      else do
+        putStrLn (paint gray "Closed proposals exist, but reveal window may not be finished:")
+        mapM_ (\p -> putStrLn (paint gray (" - " ++ pTitle p ++ ": finalize after slot " ++ show (pRevealEnd p) ++ ", current " ++ show (csSlot st)))) closedPs
+    AnyOpen -> return ()
 
 -- ============================================================
 -- MAIN
@@ -463,7 +484,6 @@ computeTally p =
 
 main :: IO ()
 main = do
-  -- create an initial audit entry for genesis (optional but nice)
   st1 <- appendEvent initChain (EAdvanceSlot 0)
   loop st1
 
@@ -475,7 +495,7 @@ loop st = do
 
     "1" -> do
       let st' = st { csSlot = csSlot st + 1 }
-      st'' <- appendEvent st' (EAdvanceSlot (csSlot st' ))
+      st'' <- appendEvent st' (EAdvanceSlot (csSlot st'))
       loop st''
 
     "2" -> do
@@ -483,89 +503,104 @@ loop st = do
       sec  <- prompt "Wallet secret (keep private): "
       let wid = csNextWid st
           w = Wallet wid name sec 0 0
-          st' = st { csNextWid = wid + 1
-                   , csWallets = M.insert wid w (csWallets st) }
+          st' = st { csNextWid = wid + 1, csWallets = M.insert wid w (csWallets st) }
       st'' <- appendEvent st' (ECreateWallet wid)
       loop st''
 
     "3" -> do
       wid <- promptInt "Wallet id to faucet: "
       case M.lookup wid (csWallets st) of
-        Nothing -> do
-          putStrLn (paint red "Wallet not found.")
-          pause
-          loop st
+        Nothing -> putStrLn (paint red "Wallet not found.") >> pause >> loop st
         Just w -> do
           let w' = w { wBalance = wBalance w + faucetAmount }
               st' = st { csWallets = M.insert wid w' (csWallets st) }
           st'' <- appendEvent st' (EFaucet wid faucetAmount)
           loop st''
 
-    "4" -> do
-      printWallets st
-      pause
-      loop st
+    "4" -> printWallets st >> pause >> loop st
 
     "5" -> do
       wid <- promptInt "Wallet id to stake from: "
       amt <- promptInt "Amount to stake: "
       case M.lookup wid (csWallets st) of
-        Nothing -> do
-          putStrLn (paint red "Wallet not found.")
-          pause
-          loop st
-        Just w -> do
-          if amt <= 0
-            then do putStrLn (paint red "Amount must be > 0.") >> pause >> loop st
-            else if wBalance w < amt
-              then do putStrLn (paint red "Insufficient balance.") >> pause >> loop st
-              else do
-                let w' = w { wBalance = wBalance w - amt, wStake = wStake w + amt }
-                    st' = st { csWallets = M.insert wid w' (csWallets st) }
-                st'' <- appendEvent st' (EStake wid amt)
-                loop st''
+        Nothing -> putStrLn (paint red "Wallet not found.") >> pause >> loop st
+        Just w ->
+          if amt <= 0 then putStrLn (paint red "Amount must be > 0.") >> pause >> loop st
+          else if wBalance w < amt then putStrLn (paint red "Insufficient balance.") >> pause >> loop st
+          else do
+            let w' = w { wBalance = wBalance w - amt, wStake = wStake w + amt }
+                st' = st { csWallets = M.insert wid w' (csWallets st) }
+            st'' <- appendEvent st' (EStake wid amt)
+            loop st''
 
-    "6" -> do
-      printProposals st
-      pause
-      loop st
+    "6" -> printProposals st >> pause >> loop st
 
+    -- 7 COMMIT vote
     "7" -> do
-      mp <- selectProposal st VoteableNow
+      mp <- selectProposal st CommitableNow
       case mp of
         Nothing -> loop st
         Just p -> do
-          wid <- promptInt "Wallet id voting: "
+          wid <- promptInt "Wallet id committing: "
           case M.lookup wid (csWallets st) of
-            Nothing -> do
-              putStrLn (paint red "Wallet not found.")
-              pause
-              loop st
+            Nothing -> putStrLn (paint red "Wallet not found.") >> pause >> loop st
             Just w -> do
-              v <- fmap (map toUpper) (prompt "Vote YES or NO: ")
-              let mv = if v == "YES" then Just YES else if v == "NO" then Just NO else Nothing
-              case mv of
-                Nothing -> do
-                  putStrLn (paint red "Invalid vote.")
-                  pause
-                  loop st
-                Just vote -> do
-                  let weight =
-                        case pMode p of
-                          OnePersonOneVote -> 1
-                          StakeWeighted    -> wStake w
-                  if weight <= 0
-                    then do
-                      putStrLn (paint red "No voting power. Stake is 0.")
-                      pause
-                      loop st
-                    else do
-                      let p' = p { pVotes = M.insert wid (vote, weight) (pVotes p) }
-                          st' = st { csProposals = M.insert (pId p) p' (csProposals st) }
-                      st'' <- appendEvent st' (EVote (pId p) wid vote weight)
-                      loop st''
+              if M.member wid (pCommits p)
+                then putStrLn (paint red "Already committed for this proposal.") >> pause >> loop st
+                else do
+                  vStr <- fmap (map toUpper) (prompt "Commit vote YES or NO (hidden later): ")
+                  let mv = if vStr == "YES" then Just YES else if vStr == "NO" then Just NO else Nothing
+                  case mv of
+                    Nothing -> putStrLn (paint red "Invalid vote.") >> pause >> loop st
+                    Just v -> do
+                      salt <- prompt "Salt (any secret string, keep it to reveal later): "
+                      let weight =
+                            case pMode p of
+                              OnePersonOneVote -> 1
+                              StakeWeighted    -> wStake w
+                      if weight <= 0
+                        then putStrLn (paint red "No voting power (stake is 0).") >> pause >> loop st
+                        else do
+                          com <- mkCommitment (pId p) wid v salt
+                          let p' = p { pCommits = M.insert wid (com, weight) (pCommits p) }
+                              st' = st { csProposals = M.insert (pId p) p' (csProposals st) }
+                          st'' <- appendEvent st' (ECommitVote (pId p) wid com weight)
+                          putStrLn (paint green ("Committed! commitment=" ++ short com))
+                          pause
+                          loop st''
 
+    -- 8 REVEAL vote
     "8" -> do
+      mp <- selectProposal st RevealableNow
+      case mp of
+        Nothing -> loop st
+        Just p -> do
+          wid <- promptInt "Wallet id revealing: "
+          case M.lookup wid (pCommits p) of
+            Nothing -> putStrLn (paint red "No commitment found for this wallet.") >> pause >> loop st
+            Just (storedCom, weight) -> do
+              if M.member wid (pReveals p)
+                then putStrLn (paint red "Already revealed for this proposal.") >> pause >> loop st
+                else do
+                  vStr <- fmap (map toUpper) (prompt "Reveal vote YES or NO: ")
+                  let mv = if vStr == "YES" then Just YES else if vStr == "NO" then Just NO else Nothing
+                  case mv of
+                    Nothing -> putStrLn (paint red "Invalid vote.") >> pause >> loop st
+                    Just v -> do
+                      salt <- prompt "Salt used in commit: "
+                      com <- mkCommitment (pId p) wid v salt
+                      if com /= storedCom
+                        then putStrLn (paint red "Reveal does not match commitment (invalid).") >> pause >> loop st
+                        else do
+                          let p' = p { pReveals = M.insert wid v (pReveals p) }
+                              st' = st { csProposals = M.insert (pId p) p' (csProposals st) }
+                          st'' <- appendEvent st' (ERevealVote (pId p) wid v weight)
+                          putStrLn (paint green "Reveal accepted ✅")
+                          pause
+                          loop st''
+
+    -- 9 close proposal (ends commits; enables reveal phase)
+    "9" -> do
       mp <- selectProposal st AnyOpen
       case mp of
         Nothing -> loop st
@@ -573,10 +608,13 @@ loop st = do
           let p' = p { pStatus = PClosed }
               st' = st { csProposals = M.insert (pId p) p' (csProposals st) }
           st'' <- appendEvent st' (EClose (pId p))
+          putStrLn (paint yellow "Proposal closed. Reveal phase begins next slot.")
+          pause
           loop st''
 
-    "9" -> do
-      mp <- selectProposal st ClosedOnly
+    -- 10 finalize (only after reveal window ends)
+    "10" -> do
+      mp <- selectProposal st FinalizableNow
       case mp of
         Nothing -> loop st
         Just p -> do
@@ -588,40 +626,28 @@ loop st = do
               proposerId = pProposer p
               proposer = csWallets st M.! proposerId
 
-              -- deposit settlement
               burnAmt = if passed then 0 else (pDeposit p * burnFailurePct) `div` 100
               refundAmt = pDeposit p - burnAmt
-
               proposer' = proposer { wBalance = wBalance proposer + refundAmt }
 
               stA = st { csWallets = M.insert proposerId proposer' (csWallets st)
-                       , csBurned = csBurned st + burnAmt }
+                       , csBurned  = csBurned st + burnAmt }
 
           stB <- appendEvent stA (EFinalize (pId p) passed yesT noT partT)
-          stC <- if refundAmt > 0
-                 then appendEvent stB (EDepositRefund (pId p) proposerId refundAmt)
-                 else return stB
-          stD <- if burnAmt > 0
-                 then appendEvent stC (EDepositBurn (pId p) burnAmt)
-                 else return stC
+          stC <- if refundAmt > 0 then appendEvent stB (EDepositRefund (pId p) proposerId refundAmt) else return stB
+          stD <- if burnAmt > 0 then appendEvent stC (EDepositBurn (pId p) burnAmt) else return stC
 
-          -- funding execution if passed and category funding
           stE <- case (passed, pCategory p, pFundingTarget p) of
                    (True, Funding, Just (toWid, amt)) ->
                      if csTreasury stD >= amt
                        then case M.lookup toWid (csWallets stD) of
-                              Nothing -> do
-                                -- if recipient missing, treat as no-op (still finalizes)
-                                return stD
+                              Nothing -> return stD
                               Just recv -> do
                                 let recv' = recv { wBalance = wBalance recv + amt }
                                     stX = stD { csTreasury = csTreasury stD - amt
                                               , csWallets  = M.insert toWid recv' (csWallets stD) }
-                                stY <- appendEvent stX (ETreasuryTransfer (pId p) toWid amt)
-                                return stY
-                       else do
-                         -- treasury insufficient: still finalize, but no transfer
-                         return stD
+                                appendEvent stX (ETreasuryTransfer (pId p) toWid amt)
+                       else return stD
                    _ -> return stD
 
           let p' = p { pStatus = PFinalized
@@ -632,10 +658,9 @@ loop st = do
                      }
               stF = stE { csProposals = M.insert (pId p) p' (csProposals stE) }
 
-          -- show result
           clearScreen
           putStrLn (paint cyan "======================================================================")
-          putStrLn (paint magenta "  FINALIZE RESULT")
+          putStrLn (paint magenta "  FINALIZE RESULT (Commit–Reveal)")
           putStrLn (paint cyan "======================================================================")
           putStrLn (paint white ("Proposal: " ++ pTitle p))
           putStrLn (paint gray ("Mode: " ++ show (pMode p) ++ " | Category: " ++ show (pCategory p)))
@@ -647,53 +672,15 @@ loop st = do
           pause
           loop stF
 
-    "10" -> do
-      clearScreen
-      putStrLn (paint cyan "======================================================================")
-      putStrLn (paint magenta "  AUDIT LOG (Hash-Chained)")
-      putStrLn (paint cyan "======================================================================")
-      if null (csEvents st)
-        then putStrLn (paint gray "  (no events)")
-        else mapM_ pp (csEvents st)
-      putStrLn (paint cyan "======================================================================")
-      pause
-      loop st
-      where
-        pp e =
-          putStrLn $
-            paint white (" #" ++ show (leIx e)) ++
-            paint gray (" slot=" ++ show (leSlot e)) ++
-            paint cyan (" " ++ short (leHash e)) ++
-            paint gray (" prev=" ++ short (lePrev e)) ++
-            paint white (" " ++ show (leEvent e))
-
-    "11" -> do
-      ok <- verifyAudit st
-      clearScreen
-      putStrLn (paint cyan "======================================================================")
-      putStrLn (paint magenta "  AUDIT VERIFY")
-      putStrLn (paint cyan "======================================================================")
-      putStrLn (if ok then paint green "Audit hash-chain: VALID ✅" else paint red "Audit hash-chain: INVALID ❌")
-      putStrLn (paint gray ("Events: " ++ show (length (csEvents st)) ++ " | Head: " ++ short (csLastHash st)))
-      putStrLn (paint cyan "======================================================================")
-      pause
-      loop st
-
     "12" -> do
       wid <- promptInt "Proposer wallet id: "
       case M.lookup wid (csWallets st) of
-        Nothing -> do
-          putStrLn (paint red "Wallet not found.")
-          pause
-          loop st
+        Nothing -> putStrLn (paint red "Wallet not found.") >> pause >> loop st
         Just w -> do
           let cost = proposalCost wid st
-          putStrLn (paint gray ("Next proposal deposit for this wallet (epoch " ++ show (currentEpoch st) ++ "): " ++ show cost))
+          putStrLn (paint gray ("Next proposal deposit (epoch " ++ show (currentEpoch st) ++ "): " ++ show cost))
           if wBalance w < cost
-            then do
-              putStrLn (paint red "Insufficient balance for deposit.")
-              pause
-              loop st
+            then putStrLn (paint red "Insufficient balance for deposit.") >> pause >> loop st
             else do
               t <- prompt "Title: "
               d <- prompt "Description: "
@@ -710,53 +697,75 @@ loop st = do
               let mode = if modeN == 2 then StakeWeighted else OnePersonOneVote
 
               qpct <- promptPct "Quorum % (0..100): "
-              s <- promptInt "Start slot: "
-              e <- promptInt "End slot: "
+              s <- promptInt "Vote start slot: "
+              e <- promptInt "Vote end slot: "
+              rEnd <- promptInt "Reveal end slot (must be >= end+1): "
 
-              -- funding details if needed
-              fTarget <- case cat of
-                           Funding -> do
-                             toWid <- promptInt "Funding recipient wallet id: "
-                             amt  <- promptInt "Funding amount from TREASURY: "
-                             return (Just (toWid, amt))
-                           _ -> return Nothing
+              let rMin = e + 1
+              if rEnd < rMin
+                then putStrLn (paint red ("Reveal end must be >= " ++ show rMin)) >> pause >> loop st
+                else do
+                  fTarget <- case cat of
+                               Funding -> do
+                                 toWid <- promptInt "Funding recipient wallet id: "
+                                 amt  <- promptInt "Funding amount from TREASURY: "
+                                 return (Just (toWid, amt))
+                               _ -> return Nothing
 
-              pid <- hash256 (show wid ++ "|" ++ t ++ "|" ++ show (csSlot st))
+                  pid <- hash256 (show wid ++ "|" ++ t ++ "|" ++ show (csSlot st))
 
-              let eligSnap = M.size (csWallets st)
-                  stakeSnap = totalStake st
-                  p = Proposal
-                        { pId = pid
-                        , pTitle = t
-                        , pDesc = d
-                        , pCategory = cat
-                        , pMode = mode
-                        , pProposer = wid
-                        , pDeposit = cost
-                        , pStart = s
-                        , pEnd = e
-                        , pQuorumPct = qpct
-                        , pEligSnap = eligSnap
-                        , pStakeSnap = stakeSnap
-                        , pFundingTarget = fTarget
-                        , pStatus = POpen
-                        , pVotes = M.empty
-                        , pResult = Nothing
-                        , pYesTotal = 0
-                        , pNoTotal = 0
-                        , pPartTotal = 0
-                        }
+                  let eligSnap = M.size (csWallets st)
+                      stakeSnap = totalStake st
 
-                  w' = w { wBalance = wBalance w - cost }
-                  key = (wid, currentEpoch st)
-                  newCount = proposalCount wid st + 1
+                      p = Proposal
+                            pid t d cat mode wid cost
+                            s e rEnd
+                            qpct eligSnap stakeSnap
+                            fTarget
+                            POpen
+                            M.empty M.empty
+                            Nothing 0 0 0
 
-                  st' = st { csWallets   = M.insert wid w' (csWallets st)
-                           , csProposals = M.insert pid p (csProposals st)
-                           , csPropCount = M.insert key newCount (csPropCount st) }
+                      w' = w { wBalance = wBalance w - cost }
+                      key = (wid, currentEpoch st)
+                      newCount = proposalCount wid st + 1
 
-              st'' <- appendEvent st' (ECreateProposal pid wid cost cat mode s e qpct)
-              loop st''
+                      st' = st { csWallets   = M.insert wid w' (csWallets st)
+                               , csProposals = M.insert pid p (csProposals st)
+                               , csPropCount = M.insert key newCount (csPropCount st) }
+
+                  st'' <- appendEvent st' (ECreateProposal pid wid cost cat mode s e rEnd qpct)
+                  loop st''
+
+    "13" -> do
+      clearScreen
+      putStrLn (paint cyan "======================================================================")
+      putStrLn (paint magenta "  AUDIT LOG (Hash-Chained)")
+      putStrLn (paint cyan "======================================================================")
+      if null (csEvents st) then putStrLn (paint gray "  (no events)") else mapM_ pp (csEvents st)
+      putStrLn (paint cyan "======================================================================")
+      pause
+      loop st
+      where
+        pp e =
+          putStrLn $
+            paint white (" #" ++ show (leIx e)) ++
+            paint gray (" slot=" ++ show (leSlot e)) ++
+            paint cyan (" " ++ short (leHash e)) ++
+            paint gray (" prev=" ++ short (lePrev e)) ++
+            paint white (" " ++ show (leEvent e))
+
+    "14" -> do
+      ok <- verifyAudit st
+      clearScreen
+      putStrLn (paint cyan "======================================================================")
+      putStrLn (paint magenta "  AUDIT VERIFY")
+      putStrLn (paint cyan "======================================================================")
+      putStrLn (if ok then paint green "Audit hash-chain: VALID ✅" else paint red "Audit hash-chain: INVALID ❌")
+      putStrLn (paint gray ("Events: " ++ show (length (csEvents st)) ++ " | Head: " ++ short (csLastHash st)))
+      putStrLn (paint cyan "======================================================================")
+      pause
+      loop st
 
     "0" -> putStrLn "Bye."
-    _ -> loop st
+    _   -> loop st

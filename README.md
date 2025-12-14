@@ -1,106 +1,134 @@
-# Cardano-Like Governance L1 (Haskell)
+# Governance L1 – Commit–Reveal Blockchain Voting (Haskell)
 
-This project is a **console-based simulation of a Cardano-style Layer-1 governance system**, written in Haskell.
+This repository contains a **console-based governance Layer-1 simulation**, written in Haskell, inspired by modern blockchain governance systems (Cardano, Polkadot, Cosmos).
 
-It is **not a cryptocurrency**, but a deterministic governance ledger that models how modern proof-of-stake blockchains (like Cardano) handle proposals, voting, quorum, deposits, treasury funding, and auditability.
+The project demonstrates how **fair, auditable, privacy-preserving digital voting** can be implemented **without digital identity systems, KYC, or social credit frameworks**.
 
-The goal is **education, experimentation, and protocol design exploration**.
+It is designed as:
+- a technical tutorial
+- a governance research prototype
+- a demonstration that digital voting can be verifiable and fair
 
 ---
 
-## ✨ Features
+## Scope and Goals
 
-### 🧾 Wallets
-- Create wallets with a private secret
+This system models **on-chain governance**, not a cryptocurrency network.
+
+It focuses on:
+- proposal lifecycle
+- voting rules
+- quorum enforcement
+- economic spam resistance
+- auditability
+- treasury governance
+
+The ledger records **authorization and consensus**, not real-world enforcement.
+
+---
+
+## Core Features
+
+### Wallets
+- Create wallets with private secrets
 - Faucet to mint governance tokens
 - Stake tokens for stake-weighted voting
-- Wallet balances + stake tracked explicitly
+- Explicit balance and stake tracking
 
 ---
 
-### 🗳️ Governance Proposals
-- Proposal **categories**:
-  - **Funding** (treasury → recipient on pass)
-  - **Policy** (parameter / rule changes)
-  - **Info** (signaling only)
-- Proposal **deposit required**
-  - Deposit cost increases **exponentially per wallet per epoch**
-- Voting window defined by **slot range**
-- One proposal can be created per wallet per slot, economically throttled
+### Governance Proposals
+- Proposal categories:
+  - **Funding** – authorize treasury transfers
+  - **Policy** – governance decisions without funds
+  - **Info** – signaling proposals
+- Proposal deposit required
+- Deposit cost increases **exponentially per wallet per epoch**
+- One proposal per wallet per slot (economic throttling)
+- Vote window and reveal window defined in slots
 
 ---
 
-### 🗳️ Voting Modes
-- **1-person-1-vote**
+### Voting Modes
+- **One-person-one-vote**
 - **Stake-weighted voting**
-- Vote weights are snapshotted at vote time
-- Proposals can only be voted on **inside their voting window**
+- Voting power snapshotted at commit time
+- Vote weight immutable once committed
 
 ---
 
-### 📊 Quorum & Tally
-- Minimum **participation quorum** (percentage-based)
+### Commit–Reveal Voting
+- Votes are **private during the voting phase**
+- Voters submit cryptographic commitments
+- Votes are revealed later with verification
+- Prevents vote buying, coercion, and strategic signaling
+- Strict time windows enforced
+
+Voting phases:
+1. Commit phase
+2. Reveal phase
+3. Finalization
+
+Votes revealed outside the reveal window are rejected.
+
+---
+
+### Quorum and Tally
+- Minimum participation quorum (percentage-based)
 - Proposal passes only if:
-  - quorum is met **and**
-  - YES votes > NO votes
-- Automatic tally on finalization
+  - quorum is met
+  - YES votes exceed NO votes
+- Tallies computed deterministically at finalization
 
 ---
 
-### 💰 Economic Rules
-- Proposal **deposit is refunded** if proposal passes
-- If proposal fails (or quorum fails):
-  - A percentage of the deposit is **burned**
-- Funding proposals pay from a **shared treasury**
-- Burned tokens are tracked separately
+### Treasury Governance
+- Treasury balance tracked globally
+- Funding proposals specify:
+  - recipient wallet
+  - funding amount
+- Treasury funds move **only if a funding proposal passes**
+- Proposal deposits:
+  - refunded on success
+  - partially burned on failure
+- Burned tokens tracked explicitly
 
 ---
 
-### 🔐 Tamper-Evident Audit Log
-- Every action emits an **event**
-- Events are **hash-chained (SHA-256)**:
-  - each event includes the previous hash
-- Full append-only audit trail:
-  - create wallet
-  - faucet
-  - stake
-  - create proposal
-  - vote
-  - close
-  - finalize
-- Ledger integrity can be verified at any time
+### Audit Log (Tamper-Evident)
+- Every action emits an event
+- Events are **hash-chained**
+- Full append-only audit trail
+- Verifiable at any time
+- Includes:
+  - wallet creation
+  - staking
+  - proposal creation
+  - vote commits
+  - vote reveals
+  - finalization
+  - treasury transfers
+  - deposit burns/refunds
 
 ---
 
-### 🖥️ Console UI
-- Colored ASCII dashboard
-- Numbered selection (no hash typing)
-- Contextual proposal selection
-- Human-friendly explanations when actions are unavailable
-- Designed to feel like a real governance CLI, not a dev REPL
+### Console Interface
+- Colored ASCII UI
+- Numbered proposal selection (no hash typing)
+- Proposal status clearly displayed:
+  - commit counts
+  - reveal counts
+  - voting windows
+- Designed for walkthroughs and screenshots
 
 ---
 
-## 🧠 Conceptual Model
-
-This project mirrors real blockchain governance:
-
-| On-Chain (simulated) | Off-Chain (real world) |
-|---------------------|------------------------|
-| Votes recorded       | Humans act on outcomes |
-| Treasury transfers   | Funds actually spent   |
-| Finalized proposals  | Policy enforcement     |
-
-The ledger **records authorization and consensus**, not real-world enforcement.
-
----
-
-## ▶️ Running the Project
+## Running the Project
 
 ### Requirements
 - Linux or macOS
 - `openssl`
-- GHC / `runhaskell`
+- GHC with `runhaskell`
 
 ### Run
 ```bash
