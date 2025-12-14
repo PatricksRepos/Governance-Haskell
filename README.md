@@ -1,135 +1,192 @@
-# Governance L1 – Commit–Reveal Blockchain Voting (Haskell)
+# Governance L1 – Commit–Reveal Voting Engine
 
-This repository contains a **console-based governance Layer-1 simulation**, written in Haskell, inspired by modern blockchain governance systems (Cardano, Polkadot, Cosmos).
+This repository contains a **single-file Haskell implementation of a Cardano-inspired Layer-1 governance system** designed to demonstrate **fair, auditable, and censorship-resistant digital voting**.
 
-The project demonstrates how **fair, auditable, privacy-preserving digital voting** can be implemented **without digital identity systems, KYC, or social credit frameworks**.
+The project is intentionally console-based and self-contained so it can be:
+- audited easily
+- learned step-by-step
+- extended into production systems later
 
-It is designed as:
-- a technical tutorial
-- a governance research prototype
-- a demonstration that digital voting can be verifiable and fair
-
----
-
-## Scope and Goals
-
-This system models **on-chain governance**, not a cryptocurrency network.
-
-It focuses on:
-- proposal lifecycle
-- voting rules
-- quorum enforcement
-- economic spam resistance
-- auditability
-- treasury governance
-
-The ledger records **authorization and consensus**, not real-world enforcement.
+No digital identity, social credit system, or centralized authority is required.
 
 ---
 
-## Core Features
+## Core Concepts
+
+This system models real blockchain governance primitives:
+
+- Slot / epoch–based time
+- Economic incentives and penalties
+- Commit–reveal voting
+- Stake-weighted or 1-person-1-vote modes
+- Treasury and proposal deposits
+- Hash-chained audit logs
+- Deterministic, replayable results
+
+The design is inspired by **Cardano governance, on-chain voting research, and cryptographic voting systems**, simplified for clarity and education.
+
+---
+
+## Why You Cannot See Votes Immediately
+
+This system uses **commit–reveal voting**.
+
+That means:
+
+- During the **commit phase**, votes are intentionally hidden
+- Only cryptographic commitments (hashes) are stored
+- No one can see YES / NO totals early
+- This prevents coercion, bribery, and bandwagon effects
+
+Votes become visible **only after**:
+1. the reveal window opens
+2. voters reveal their vote + salt
+3. the proposal is closed
+4. the proposal is finalized
+
+This behavior is **by design** and mirrors how secure governance systems work.
+
+---
+
+## Features
 
 ### Wallets
-- Create wallets with private secrets
-- Faucet to mint governance tokens
-- Stake tokens for stake-weighted voting
-- Explicit balance and stake tracking
+- Wallet creation
+- Faucet funding
+- Token balances
+- Token staking (locked stake)
 
----
-
-### Governance Proposals
+### Proposals
+- Created by wallets (not admins)
+- Deposit required (economic throttle)
+- Deposit refunded on pass
+- Deposit burned on failure
 - Proposal categories:
-  - **Funding** – authorize treasury transfers
-  - **Policy** – governance decisions without funds
-  - **Info** – signaling proposals
-- Proposal deposit required
-- Deposit cost increases **exponentially per wallet per epoch**
-- One proposal per wallet per slot (economic throttling)
-- Vote window and reveal window defined in slots
+  - Funding
+  - Policy
+  - Information
+- Treasury funding proposals supported
 
----
+### Voting
+- Commit–reveal scheme
+- Vote windows enforced by slot
+- Reveal windows enforced by slot
+- Public or private voting modes
+- One-person-one-vote
+- Stake-weighted voting
+- Quorum enforcement
+- Double-vote prevention
 
-### Voting Modes
-- **One-person-one-vote**
-- **Stake-weighted voting**
-- Voting power snapshotted at commit time
-- Vote weight immutable once committed
+### Governance & Economics
+- Treasury balance
+- Burn tracking
+- Economic throttling via deposits
+- Slot-based lifecycle
+- Epoch awareness
 
----
-
-### Commit–Reveal Voting
-- Votes are **private during the voting phase**
-- Voters submit cryptographic commitments
-- Votes are revealed later with verification
-- Prevents vote buying, coercion, and strategic signaling
-- Strict time windows enforced
-
-Voting phases:
-1. Commit phase
-2. Reveal phase
-3. Finalization
-
-Votes revealed outside the reveal window are rejected.
-
----
-
-### Quorum and Tally
-- Minimum participation quorum (percentage-based)
-- Proposal passes only if:
-  - quorum is met
-  - YES votes exceed NO votes
-- Tallies computed deterministically at finalization
-
----
-
-### Treasury Governance
-- Treasury balance tracked globally
-- Funding proposals specify:
-  - recipient wallet
-  - funding amount
-- Treasury funds move **only if a funding proposal passes**
-- Proposal deposits:
-  - refunded on success
-  - partially burned on failure
-- Burned tokens tracked explicitly
-
----
-
-### Audit Log (Tamper-Evident)
-- Every action emits an event
-- Events are **hash-chained**
-- Full append-only audit trail
-- Verifiable at any time
-- Includes:
-  - wallet creation
-  - staking
-  - proposal creation
-  - vote commits
-  - vote reveals
-  - finalization
-  - treasury transfers
-  - deposit burns/refunds
-
----
+### Audit & Integrity
+- Event log
+- Hash-chained audit trail
+- Proposal certification records
+- Deterministic finalization
+- Verifiable results
 
 ### Console Interface
-- Colored ASCII UI
-- Numbered proposal selection (no hash typing)
-- Proposal status clearly displayed:
-  - commit counts
-  - reveal counts
-  - voting windows
-- Designed for walkthroughs and screenshots
+- ANSI-colored output
+- Compact ASCII layout
+- Clear lifecycle phases
+- Proposal listings with:
+  - short IDs
+  - status
+  - vote & reveal windows
+  - participation counts
 
 ---
 
-## Running the Project
+## Typical Workflow
 
-### Requirements
-- Linux or macOS
-- `openssl`
-- GHC with `runhaskell`
+1. Advance slots to move time forward
+2. Create wallets
+3. Faucet tokens into wallets
+4. (Optional) Stake tokens
+5. Create a proposal (deposit is locked)
+6. Advance into the commit window
+7. Commit votes (vote + salt → hash)
+8. Advance into the reveal window
+9. Reveal votes (vote + salt verified)
+10. Close the proposal
+11. Finalize the proposal
+12. Review certification and audit logs
 
-### Run
-```bash
-runhaskell SimpleL1.hs
+Results are **only shown after finalization**.
+
+---
+
+## What This Is (and Is Not)
+
+### This IS:
+- A realistic governance simulation
+- A teaching tool for blockchain voting
+- A foundation for enterprise or organizational governance
+- A system designed for transparency without surveillance
+
+### This is NOT:
+- A production blockchain
+- A replacement for cryptographic libraries
+- A finished ZK implementation (but it is ZK-ready)
+
+---
+
+## ZK Readiness
+
+The commit–reveal structure is intentionally designed so that:
+- Commitments can later be replaced with zero-knowledge proofs
+- Tallies can be verified without revealing individual votes
+- Privacy can be increased without changing governance logic
+
+This makes the system suitable for future work on:
+- ZK vote tallying
+- anonymous credentials
+- confidential governance
+
+---
+
+## License & Use
+
+This project is provided for:
+- education
+- research
+- experimentation
+- governance prototyping
+
+It is intentionally simple, readable, and extensible.
+
+---
+
+## Next Steps (Planned / Optional)
+
+- Zero-knowledge tally proofs
+- JSON export of certifications
+- Proposal selection menus (no ID typing)
+- Persistent storage
+- Networked multi-node simulation
+- Documentation walkthrough / tutorial mode
+
+---
+
+## Philosophy
+
+Digital voting **does not require**:
+- biometric IDs
+- centralized databases
+- social credit systems
+- surveillance infrastructure
+
+It requires:
+- cryptography
+- economic incentives
+- transparency
+- verifiability
+- time-based finality
+
+This project exists to demonstrate that clearly.
